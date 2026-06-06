@@ -64,6 +64,7 @@ export interface RowExpandZone {
   isGroupToggle?: boolean;
   groupKey?: string;
   isTextToggle?: boolean;
+  isJsonToggle?: boolean;
   rowKey?: string;
   x: number;
   y: number;
@@ -87,8 +88,8 @@ export function getNodeHeaderIconZones(
   const top = iconCenterY - half;
 
   return {
-    eye:    { x: eyeCx  - half, y: top, w: iconSize, h: iconSize },
-    info:   { x: infoCx - half, y: top, w: iconSize, h: iconSize },
+    eye: { x: eyeCx - half, y: top, w: iconSize, h: iconSize },
+    info: { x: infoCx - half, y: top, w: iconSize, h: iconSize },
     expand: expandCx !== null
       ? { x: expandCx - half, y: top, w: iconSize, h: iconSize }
       : null,
@@ -561,13 +562,27 @@ export function formatValueSummary(value: unknown): string {
   return String(value);
 }
 
-export function getRowUntruncatedValue(node: ShikoNode<unknown>, line: string, i: number): string {
+export function getRowUntruncatedValue(
+  node: ShikoNode<unknown>,
+  line: string,
+  i: number,
+  expandedJsonRows?: ReadonlySet<string>,
+): string {
   const separatorIndex = line.indexOf(":");
   if (separatorIndex <= 0) {
     const val = node.data && typeof node.data === "object" && "value" in node.data
       ? (node.data as any).value
       : null;
-    return val !== null && val !== undefined ? formatValueSummary(val) : line;
+    let actualVal = val !== null && val !== undefined ? formatValueSummary(val) : line;
+    const rowKey = `row-${i}`;
+    const rowId = `${node.id}::${rowKey}`;
+    if (expandedJsonRows?.has(rowId)) {
+      try {
+        const parsed = JSON.parse(actualVal);
+        actualVal = formatValueSummary(parsed);
+      } catch {}
+    }
+    return actualVal;
   }
 
   const keyPart = line.slice(0, separatorIndex).trim();
@@ -575,14 +590,27 @@ export function getRowUntruncatedValue(node: ShikoNode<unknown>, line: string, i
     ? (node.data as any).value
     : null;
 
+  let actualVal: unknown = undefined;
   if (valObj && typeof valObj === "object") {
-    const actualVal = (valObj as any)[keyPart];
-    if (actualVal !== undefined) {
-      return formatValueSummary(actualVal);
-    }
+    actualVal = (valObj as any)[keyPart];
   }
 
-  return line.slice(separatorIndex + 1).trimStart();
+  let finalValStr = "";
+  if (actualVal !== undefined) {
+    finalValStr = actualVal !== null && typeof actualVal === "string" ? actualVal : formatValueSummary(actualVal);
+  } else {
+    finalValStr = line.slice(separatorIndex + 1).trimStart();
+  }
+
+  const rowId = `${node.id}::${keyPart}`;
+  if (expandedJsonRows?.has(rowId)) {
+    try {
+      const parsed = JSON.parse(finalValStr);
+      finalValStr = formatValueSummary(parsed);
+    } catch {}
+  }
+
+  return finalValStr;
 }
 
 export function getWrappedLinesCount(
@@ -593,8 +621,9 @@ export function getWrappedLinesCount(
   maxTextWidth: number,
   fontSize: number,
   avgCharWidth: number,
+  expandedJsonRows?: ReadonlySet<string>,
 ): number {
-  const untruncatedVal = getRowUntruncatedValue(node, line, i);
+  const untruncatedVal = getRowUntruncatedValue(node, line, i, expandedJsonRows);
   const separatorIndex = line.indexOf(":");
   if (separatorIndex <= 0) {
     const wrapped = getWrappedLinesForValue(ctx, untruncatedVal, maxTextWidth, fontSize, avgCharWidth);
@@ -626,6 +655,7 @@ export function estimateNodeSize(
   font: string,
   defaultNodeSize: Size,
   expandedTextRows?: ReadonlySet<string>,
+  expandedJsonRows?: ReadonlySet<string>,
 ): Size {
   const label = node.label ?? node.id;
   const lines = label.split("\n").filter((line) => line.trim().length > 0);
@@ -639,10 +669,17 @@ export function estimateNodeSize(
   const horizontalPadding = 14;
 
   const hasWrappedLines = bodyLines.some((line, i) => {
-    const untruncated = getRowUntruncatedValue(node, line, i);
+    const untruncated = getRowUntruncatedValue(node, line, i, expandedJsonRows);
     return untruncated.length * avgCharWidth > defaultNodeSize.width - horizontalPadding * 2 - 60;
   });
-  const hasButtons = node.children.length > 0 || hasWrappedLines;
+  // JSON-parseable rows always need a button
+  const hasJsonRows = bodyLines.some((line) => {
+    const sepIdx = line.indexOf(":");
+    if (sepIdx <= 0) return false;
+    const val = getRowUntruncatedValue(node, line, 0);
+    return isParseableJsonString(val);
+  });
+  const hasButtons = node.children.length > 0 || hasWrappedLines || hasJsonRows;
   const rowBtnReserve = hasButtons
     ? Math.max(5, 5.5) * 2 + (6 + 4)
     : 0;
@@ -662,7 +699,7 @@ export function estimateNodeSize(
       if (separatorIndex > 0) {
         const keyPart = line.slice(0, separatorIndex + 1);
         const keyDisplay = `${keyPart} `;
-        const untruncatedVal = getRowUntruncatedValue(node, line, firstLineIsItemHeader ? i - 1 : i);
+        const untruncatedVal = getRowUntruncatedValue(node, line, firstLineIsItemHeader ? i - 1 : i, expandedJsonRows);
         let kw = 0;
         let vw = 0;
         if (ctx) {
@@ -694,8 +731,7 @@ export function estimateNodeSize(
     const rowKey = parseRowKey(line) || `row-${i}`;
     const rowId = `${node.id}::${rowKey}`;
     const isRowExpanded = expandedTextRows?.has(rowId) ?? false;
-
-    const wrappedLinesCount = getWrappedLinesCount(ctx, node, line, i, maxTextWidth, fontSize, avgCharWidth);
+    const wrappedLinesCount = getWrappedLinesCount(ctx, node, line, i, maxTextWidth, fontSize, avgCharWidth, expandedJsonRows);
     const finalRowLines = isRowExpanded ? wrappedLinesCount : Math.min(4, wrappedLinesCount);
     totalBodyLines += finalRowLines;
   }
@@ -854,18 +890,52 @@ export interface RenderCanvasOptions {
   canvasColors?: CanvasColors | undefined;
   expandedIds?: ReadonlySet<string>;
   expandedTextRowIds?: ReadonlySet<string>;
+  expandedJsonRowIds?: ReadonlySet<string>;
   hiddenIds?: ReadonlySet<string>;
   hiddenGroupKeys?: ReadonlyMap<string, ReadonlySet<string>>;
+  /** Injected synthetic nodes from parsed JSON strings, keyed by parentId::rowKey. */
+  injectedNodeMap?: ReadonlyMap<string, ShikoNode<unknown>>;
 }
 
 /**
  * Parses the key from a label line like "details: {2 keys}" → "details".
  * Returns null if no colon separator is found at a valid position.
  */
-function parseRowKey(line: string): string | null {
+export function parseRowKey(line: string): string | null {
   const idx = line.indexOf(":");
   if (idx <= 0) return null;
   return line.slice(0, idx).trim();
+}
+
+/**
+ * Checks if a string value is valid JSON (object or array) that can be
+ * parsed and displayed inline.
+ */
+export function isParseableJsonString(value: string): boolean {
+  const trimmed = value.trim();
+  if (!((trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+    (trimmed.startsWith("[") && trimmed.endsWith("]")))) {
+    return false;
+  }
+  try {
+    const parsed = JSON.parse(trimmed);
+    return parsed !== null && typeof parsed === "object";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Formats a parsed JSON value as indented display lines.
+ * Returns an array of strings, one per line.
+ */
+export function formatJsonLines(value: string, indent = 2): string[] {
+  try {
+    const parsed = JSON.parse(value.trim());
+    return JSON.stringify(parsed, null, indent).split("\n");
+  } catch {
+    return [value];
+  }
 }
 
 /**
@@ -894,6 +964,7 @@ export function computeNodeRowExpandZones(
   scale: number,
   font: string,
   expandedTextRows?: ReadonlySet<string>,
+  expandedJsonRows?: ReadonlySet<string>,
 ): RowExpandZone[] {
   const label = node.label ?? node.id;
   const lines = label.split("\n").filter((l) => l.trim().length > 0);
@@ -942,12 +1013,14 @@ export function computeNodeRowExpandZones(
     const rowKey = parseRowKey(line) || `row-${i}`;
     const rowId = `${node.id}::${rowKey}`;
     const isRowExpanded = expandedTextRows?.has(rowId) ?? false;
+    const isJsonRowExpanded = expandedJsonRows?.has(rowId) ?? false;
 
-    const untruncatedVal = getRowUntruncatedValue(node, line, i);
+    const untruncatedVal = getRowUntruncatedValue(node, line, i, expandedJsonRows);
     const separatorIndex = line.indexOf(":");
     let wrapped: string[] = [];
     let keyWidth = 0;
     let valueWidth = maxTextWidth;
+
     if (separatorIndex <= 0) {
       wrapped = getWrappedLinesForValue(ctx, untruncatedVal, maxTextWidth, worldFontSize * scale, Math.max(6.2, worldFontSize * 0.54) * scale);
     } else {
@@ -1005,6 +1078,9 @@ export function computeNodeRowExpandZones(
       h: btnDiameter,
     };
 
+    const rowId2 = `${node.id}::${rowKey}`;
+    const isJsonExpanded = expandedJsonRows?.has(rowId2) ?? false;
+
     if (isExpandableLine(line)) {
       const key = parseRowKey(line);
       if (key !== null) {
@@ -1027,17 +1103,43 @@ export function computeNodeRowExpandZones(
           zones.push({ childId: node.id, isExpansionToggle: true, ...zoneBase });
         }
       }
-    } else if (wrappedLinesCount > 4) {
-      zones.push({
-        childId: node.id,
-        isExpansionToggle: false,
-        isTextToggle: true,
-        rowKey,
-        x: screenPos.x + horizontalPadding + keyWidth,
-        y: rowTop,
-        w: valueWidth,
-        h: rowLinesCount[i]! * rowHeight,
-      });
+    } else {
+      // Check if value is a parseable JSON string — add JSON toggle button
+      const sepIdx = line.indexOf(":");
+      if (sepIdx > 0) {
+        const rawVal = getRowUntruncatedValue(node, line, i);
+        if (isParseableJsonString(rawVal)) {
+          zones.push({
+            childId: node.id,
+            isExpansionToggle: false,
+            isJsonToggle: true,
+            rowKey,
+            ...zoneBase,
+          });
+        } else if (wrappedLinesCount > 4 && !isJsonExpanded) {
+          zones.push({
+            childId: node.id,
+            isExpansionToggle: false,
+            isTextToggle: true,
+            rowKey,
+            x: screenPos.x + horizontalPadding + keyWidth,
+            y: rowTop,
+            w: valueWidth,
+            h: rowLinesCount[i]! * rowHeight,
+          });
+        }
+      } else if (wrappedLinesCount > 4) {
+        zones.push({
+          childId: node.id,
+          isExpansionToggle: false,
+          isTextToggle: true,
+          rowKey,
+          x: screenPos.x + horizontalPadding + keyWidth,
+          y: rowTop,
+          w: valueWidth,
+          h: rowLinesCount[i]! * rowHeight,
+        });
+      }
     }
 
     currentLinesOffset += rowLinesCount[i]!;
@@ -1076,6 +1178,7 @@ export function drawNodeRowExpandButtons(
   iconColor: string,
   hiddenGroupKeys?: ReadonlyMap<string, ReadonlySet<string>>,
   expandedTextRowIds?: ReadonlySet<string>,
+  expandedJsonRowIds?: ReadonlySet<string>,
 ): void {
   if (zones.length === 0) return;
 
@@ -1091,7 +1194,9 @@ export function drawNodeRowExpandButtons(
     const cy = zone.y + zone.h / 2;
 
     let showMinus = true;
-    if (zone.isTextToggle && zone.rowKey) {
+    if (zone.isJsonToggle && zone.rowKey) {
+      showMinus = expandedJsonRowIds?.has(`${zone.childId}::${zone.rowKey}`) ?? false;
+    } else if (zone.isTextToggle && zone.rowKey) {
       showMinus = expandedTextRowIds?.has(`${zone.childId}::${zone.rowKey}`) ?? false;
     } else if (zone.isExpansionToggle) {
       showMinus = expandedIds.has(zone.childId);
@@ -1144,8 +1249,10 @@ export function drawGraphCanvas(options: RenderCanvasOptions): void {
     canvasColors,
     expandedIds,
     expandedTextRowIds,
+    expandedJsonRowIds,
     hiddenIds,
     hiddenGroupKeys,
+    injectedNodeMap,
   } = options;
 
   const colors: CanvasColors = canvasColors ?? DEFAULT_CANVAS_COLORS;
@@ -1187,7 +1294,17 @@ export function drawGraphCanvas(options: RenderCanvasOptions): void {
   };
 
   for (const [nodeId, node] of nodes.entries()) {
-    if (node.children.length === 0) {
+    let hasInjected = false;
+    if (injectedNodeMap) {
+      for (const key of injectedNodeMap.keys()) {
+        if (key.startsWith(`${nodeId}::`)) {
+          hasInjected = true;
+          break;
+        }
+      }
+    }
+
+    if (node.children.length === 0 && !hasInjected) {
       continue;
     }
 
@@ -1248,6 +1365,16 @@ export function drawGraphCanvas(options: RenderCanvasOptions): void {
         } else {
           if (node.edgeLabel) {
             keyToWorldY.set(node.edgeLabel, fromPos.y + rowCenterY);
+          }
+        }
+      } else {
+        // Also map JSON-parseable string rows so injected nodes connect from the right Y
+        const key = parseRowKey(line);
+        if (key !== null) {
+          const val = getRowUntruncatedValue(node, line, i);
+          if (isParseableJsonString(val)) {
+            const rowCenterY = worldBlockStartY + currentLinesOffset * worldRowHeight + worldRowHeight / 2;
+            keyToWorldY.set(key, fromPos.y + rowCenterY);
           }
         }
       }
@@ -1335,6 +1462,64 @@ export function drawGraphCanvas(options: RenderCanvasOptions): void {
       }
 
       context.globalAlpha = 1.0;
+    }
+
+    // Draw edges to injected (parsed JSON) nodes
+    if (injectedNodeMap) {
+      for (const [key, injectedNode] of injectedNodeMap) {
+        const sep = key.indexOf("::");
+        if (sep < 0) continue;
+        const parentId = key.slice(0, sep);
+        const rowKey = key.slice(sep + 2);
+        if (parentId !== nodeId) continue;
+
+        const toPos = positions.get(injectedNode.id);
+        const toSize = sizes.get(injectedNode.id);
+        if (!toPos || !toSize) continue;
+
+        // Find Y from the row matching the rowKey
+        const startY = keyToWorldY.get(rowKey) ?? (fromPos.y + fromSize.height / 2);
+        const fromRightW = { x: fromPos.x + fromSize.width, y: startY };
+        const toLeftW = { x: toPos.x, y: toPos.y + toSize.height / 2 };
+
+        const minX2 = Math.min(fromRightW.x, toLeftW.x);
+        const maxX2 = Math.max(fromRightW.x, toLeftW.x);
+        const minY2 = Math.min(fromRightW.y, toLeftW.y);
+        const maxY2 = Math.max(fromRightW.y, toLeftW.y);
+        if (
+          minX2 > edgeVisibleWorld.x + edgeVisibleWorld.width ||
+          maxX2 < edgeVisibleWorld.x ||
+          minY2 > edgeVisibleWorld.y + edgeVisibleWorld.height ||
+          maxY2 < edgeVisibleWorld.y
+        ) continue;
+
+        const fromRight = viewport.worldToScreen(fromRightW);
+        const toLeft = viewport.worldToScreen(toLeftW);
+        const dx2 = toLeft.x - fromRight.x;
+
+        context.globalAlpha = !highlightSet || highlightSet.has(nodeId) ? 1.0 : DIMMED_ALPHA;
+        context.strokeStyle = colors.edge;
+        context.beginPath();
+        context.moveTo(fromRight.x, fromRight.y);
+        context.bezierCurveTo(
+          fromRight.x + dx2 * 0.5, fromRight.y,
+          toLeft.x - dx2 * 0.5, toLeft.y,
+          toLeft.x, toLeft.y,
+        );
+        context.stroke();
+
+        if (viewport.scale >= 0.4) {
+          const labelX = (fromRight.x + toLeft.x) / 2;
+          const labelY = (fromRight.y + toLeft.y) / 2;
+          const edgeFontSize = 11 * viewport.scale;
+          context.font = `500 ${edgeFontSize.toFixed(1)}px ${extractFontFamily(font)}`;
+          context.textAlign = "center";
+          context.textBaseline = "middle";
+          context.fillStyle = colors.edgeLabel;
+          context.fillText(rowKey, labelX, labelY - edgeFontSize * 0.7);
+        }
+        context.globalAlpha = 1.0;
+      }
     }
   }
 
@@ -1440,10 +1625,17 @@ export function drawGraphCanvas(options: RenderCanvasOptions): void {
 
       const hasWrappedLines = bodyLines.some((line, i) => {
         const charW = Math.max(6.2, worldFontSize * 0.54) * viewport.scale;
-        const untruncated = getRowUntruncatedValue(node, line, i);
+        const untruncated = getRowUntruncatedValue(node, line, i, expandedJsonRowIds);
         return untruncated.length * charW > screenWidth - horizontalPadding * 2 - 60 * viewport.scale;
       });
-      const hasButtons = node.children.length > 0 || hasWrappedLines;
+      // JSON-parseable string rows always need a button
+      const hasJsonRows = bodyLines.some((line) => {
+        const sep = line.indexOf(":");
+        if (sep <= 0) return false;
+        const val = getRowUntruncatedValue(node, line, 0);
+        return isParseableJsonString(val);
+      });
+      const hasButtons = node.children.length > 0 || hasWrappedLines || hasJsonRows;
       const rowBtnReserve = hasButtons
         ? Math.max(5, 5.5 * viewport.scale) * 2 + (6 + 4) * viewport.scale
         : 0;
@@ -1467,9 +1659,10 @@ export function drawGraphCanvas(options: RenderCanvasOptions): void {
         const rowId = `${node.id}::${rowKey}`;
         const isRowExpanded = expandedTextRowIds?.has(rowId) ?? false;
 
-        const untruncatedVal = getRowUntruncatedValue(node, line, i);
+        const untruncatedVal = getRowUntruncatedValue(node, line, i, expandedJsonRowIds);
         const separatorIndex = line.indexOf(":");
         let wrapped: string[] = [];
+
         if (separatorIndex <= 0) {
           wrapped = getWrappedLinesForValue(context, untruncatedVal, maxTextWidth, fontSize, Math.max(6.2, worldFontSize * 0.54) * viewport.scale);
         } else {
@@ -1502,6 +1695,7 @@ export function drawGraphCanvas(options: RenderCanvasOptions): void {
         const rowKey = parseRowKey(line) || `row-${i}`;
         const rowId = `${node.id}::${rowKey}`;
         const isRowExpanded = expandedTextRowIds?.has(rowId) ?? false;
+        const isJsonRowExpanded = expandedJsonRowIds?.has(rowId) ?? false;
 
         const finalRowLines = rowLinesCount[i]!;
         const rowHeightForThisRow = finalRowLines * rowHeight;
@@ -1539,7 +1733,6 @@ export function drawGraphCanvas(options: RenderCanvasOptions): void {
           }
         }
 
-        // Draw key on the first line if present
         if (keyWidth > 0) {
           const firstLineCenterY = currentRowTop + rowHeight / 2;
           context.fillStyle = isSelected ? colors.textItemHeaderSelected : colors.textKey;
@@ -1624,6 +1817,7 @@ export function drawGraphCanvas(options: RenderCanvasOptions): void {
         viewport.scale,
         font,
         expandedTextRowIds,
+        expandedJsonRowIds,
       );
       if (rowZones.length > 0) {
         const iconColor = brokenNode
@@ -1636,6 +1830,7 @@ export function drawGraphCanvas(options: RenderCanvasOptions): void {
           viewport.scale, iconColor,
           hiddenGroupKeys,
           expandedTextRowIds,
+          expandedJsonRowIds,
         );
       }
     }

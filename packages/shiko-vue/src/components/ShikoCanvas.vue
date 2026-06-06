@@ -53,6 +53,8 @@ import {
   estimateNodeSize,
   computeNodeRowExpandZones,
   hitTestRowExpandZones,
+  getRowUntruncatedValue,
+  parseRowKey,
 } from "../utils/renderUtils";
 
 interface CanvasProps {
@@ -104,6 +106,9 @@ const emit = defineEmits<{
       total: number;
     },
   ];
+  /** Emitted when user clicks the JSON toggle on a string row that contains parseable JSON.
+   *  The handler should parse `rawJsonValue` and call tree.injectJsonNode(nodeId, rowKey, parsedNode). */
+  jsonRowExpand: [payload: { nodeId: string; rowKey: string; rawJsonValue: string }];
 }>();
 
 const containerRef = shallowRef<HTMLDivElement | null>(null);
@@ -187,6 +192,73 @@ onBeforeUnmount(() => {
   unsubscribeViewport();
   resizeObserver?.disconnect();
 });
+
+/**
+ * Builds a virtual copy of the tree that splices injected nodes in as children
+ * of their respective parent nodes. This is needed so the layout algorithm
+ * positions injected nodes correctly.
+ */
+function buildVirtualRoot(
+  root: ShikoNode<unknown>,
+  injectedNodeMap: ReadonlyMap<string, ShikoNode<unknown>>,
+): ShikoNode<unknown> {
+  if (injectedNodeMap.size === 0) {
+    return root;
+  }
+
+  // Pre-group injected nodes by parent ID to make lookup quick
+  const injectedByParent = new Map<string, ShikoNode<unknown>[]>();
+  for (const [key, node] of injectedNodeMap) {
+    const sep = key.indexOf("::");
+    if (sep < 0) continue;
+    const parentId = key.slice(0, sep);
+    let list = injectedByParent.get(parentId);
+    if (!list) {
+      list = [];
+      injectedByParent.set(parentId, list);
+    }
+    list.push(node);
+  }
+
+  function recurse(node: ShikoNode<unknown>): ShikoNode<unknown> {
+    const virtualChildren: ShikoNode<unknown>[] = [];
+
+    // Process original children
+    for (const child of node.children) {
+      virtualChildren.push(recurse(child));
+    }
+
+    // Append injected children for this parent
+    const extra = injectedByParent.get(node.id);
+    if (extra) {
+      for (const child of extra) {
+        virtualChildren.push(recurse(child));
+      }
+    }
+
+    if (virtualChildren.length === node.children.length) {
+      // Check if any children actually changed their reference/identity.
+      // If none changed, and no extra children, we can return the same node.
+      let same = true;
+      for (let i = 0; i < virtualChildren.length; i++) {
+        if (virtualChildren[i] !== node.children[i]) {
+          same = false;
+          break;
+        }
+      }
+      if (same) {
+        return node;
+      }
+    }
+
+    return {
+      ...node,
+      children: virtualChildren,
+    };
+  }
+
+  return recurse(root);
+}
 
 watch(
   () => props.root,
@@ -289,6 +361,7 @@ function resolveCursorForHit(local: Point, hit: string | null): CanvasCursor {
         viewport.scale,
         props.font,
         tree.expandedTextRowIds,
+        tree.expandedJsonRowIds,
       );
       if (hitTestRowExpandZones(local.x, local.y, rowZones) !== null) {
         return "pointer";
@@ -337,7 +410,7 @@ async function rebuildLayoutInternal(layoutRunId: number): Promise<void> {
       }
 
       idToNode.set(node.id, node);
-      sizes.set(node.id, estimateNodeSize(node, props.font, props.nodeSize, tree.expandedTextRowIds));
+      sizes.set(node.id, estimateNodeSize(node, props.font, props.nodeSize, tree.expandedTextRowIds, tree.expandedJsonRowIds));
       processed += 1;
 
       if (processed % props.layoutChunkSize === 0) {
@@ -358,12 +431,15 @@ async function rebuildLayoutInternal(layoutRunId: number): Promise<void> {
   } else {
     for (const node of visibleNodes) {
       idToNode.set(node.id, node);
-      sizes.set(node.id, estimateNodeSize(node, props.font, props.nodeSize, tree.expandedTextRowIds));
+      sizes.set(node.id, estimateNodeSize(node, props.font, props.nodeSize, tree.expandedTextRowIds, tree.expandedJsonRowIds));
     }
   }
 
+  // Build a virtual root that includes injected nodes as children so the layout sees them
+  const virtualRoot = buildVirtualRoot(root, tree.injectedNodeMap);
+
   const layoutInput = {
-    root,
+    root: virtualRoot,
     childSizes: sizes,
     expandedIds: tree.expandedIds,
   } as {
@@ -382,10 +458,11 @@ async function rebuildLayoutInternal(layoutRunId: number): Promise<void> {
   const edgeLabelPadding = 20;
   const maxLabelWidthByDepth = new Map<number, number>();
   const nodeDepths = new Map<string, number>();
+  const virtualNodeMap = new Map<string, ShikoNode<unknown>>();
 
   {
     const depthStack: Array<{ node: ShikoNode<unknown>; depth: number }> = [
-      { node: root, depth: 0 },
+      { node: virtualRoot, depth: 0 },
     ];
 
     while (depthStack.length > 0) {
@@ -395,6 +472,7 @@ async function rebuildLayoutInternal(layoutRunId: number): Promise<void> {
       }
 
       nodeDepths.set(frame.node.id, frame.depth);
+      virtualNodeMap.set(frame.node.id, frame.node);
 
       if (tree.expandedIds.has(frame.node.id)) {
         for (const child of frame.node.children) {
@@ -410,7 +488,8 @@ async function rebuildLayoutInternal(layoutRunId: number): Promise<void> {
     }
 
     const depth = nodeDepths.get(node.id) ?? 0;
-    for (const child of node.children) {
+    const vNode = virtualNodeMap.get(node.id) ?? node;
+    for (const child of vNode.children) {
       if (!child.edgeLabel) {
         continue;
       }
@@ -550,8 +629,10 @@ function drawCanvas(): void {
     font: props.font,
     expandedIds: tree.expandedIds,
     expandedTextRowIds: tree.expandedTextRowIds,
+    expandedJsonRowIds: tree.expandedJsonRowIds,
     hiddenIds: tree.hiddenIds,
     hiddenGroupKeys: tree.hiddenGroupKeys,
+    injectedNodeMap: tree.injectedNodeMap,
   });
 }
 
@@ -707,12 +788,34 @@ function onClick(event: MouseEvent): void {
         viewport.scale,
         props.font,
         tree.expandedTextRowIds,
+        tree.expandedJsonRowIds,
       );
       const rowZone = hitTestRowExpandZones(local.x, local.y, rowZones);
       if (rowZone !== null) {
         event.stopPropagation();
         if (rowZone.isTextToggle && rowZone.rowKey) {
           tree.toggleTextRowExpansion(node.id, rowZone.rowKey);
+        } else if (rowZone.isJsonToggle && rowZone.rowKey) {
+          if (tree.isJsonRowExpanded(node.id, rowZone.rowKey)) {
+            // Collapse: remove the injected node
+            tree.toggleJsonRowExpansion(node.id, rowZone.rowKey);
+          } else {
+            // Expand: find the raw JSON string and emit for the app to parse
+            const label = node.label ?? node.id;
+            const lines = label.split("\n").filter((l) => l.trim().length > 0);
+            let rawJsonValue = "";
+            for (let i = 0; i < lines.length; i++) {
+              const line = lines[i]!;
+              const rk = parseRowKey(line) || `row-${i}`;
+              if (rk === rowZone.rowKey) {
+                rawJsonValue = getRowUntruncatedValue(node, line, i);
+                break;
+              }
+            }
+            if (rawJsonValue) {
+              emit("jsonRowExpand", { nodeId: node.id, rowKey: rowZone.rowKey, rawJsonValue });
+            }
+          }
         } else if (rowZone.isExpansionToggle) {
           tree.toggleExpansion(rowZone.childId);
         } else if (rowZone.isGroupToggle && rowZone.groupKey) {

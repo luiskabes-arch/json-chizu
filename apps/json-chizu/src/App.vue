@@ -129,6 +129,7 @@
           @nodeFocus="onNodeFocus"
           @nodeInfo="onNodeInfo"
           @layoutProgress="onLayoutProgress"
+          @jsonRowExpand="onJsonRowExpand"
         />
 
         <!-- Context Menu -->
@@ -208,6 +209,7 @@ import {
   ShikoSelectionController,
   ShikoTreeController,
   ShikoViewportController,
+  copyNode,
   createLeafNode,
   createNode,
 } from "@shiko/core";
@@ -566,6 +568,43 @@ function onNodeFocus(nodeId: string): void {
 
 function onNodeInfo(payload: { nodeId: string; event: MouseEvent }): void {
   onNodeContextMenu(payload);
+}
+
+/**
+ * Handles the jsonRowExpand event from ShikoCanvas.
+ * Parses the raw JSON string and injects the resulting node as a child.
+ */
+function onJsonRowExpand(payload: { nodeId: string; rowKey: string; rawJsonValue: string }): void {
+  try {
+    const parsed = JSON.parse(payload.rawJsonValue);
+    // Wrap the parsed value inside an object with the rowKey, so it gets converted
+    // as a standard child node rather than a standalone root node.
+    const wrapped = { [payload.rowKey]: parsed };
+    const result = convertJsonToShiko(wrapped, {
+      maxNodes: 2000,
+      maxDepth: 20,
+      maxLabelLength: maxLabelLength.value,
+    });
+    const targetNode = result.root.children[0];
+    if (!targetNode) {
+      return;
+    }
+    // Use a namespaced ID prefix so injected nodes never clash with real tree node IDs
+    const prefixedNode = prefixNodeIds(targetNode, `__json__${payload.nodeId}__${payload.rowKey}__`);
+    treeController.injectJsonNode(payload.nodeId, payload.rowKey, prefixedNode);
+  } catch {
+    // If parse fails silently, do nothing
+  }
+}
+
+/**
+ * Recursively re-IDs a ShikoNode tree with the given prefix to avoid ID collisions.
+ */
+function prefixNodeIds(node: import('@shiko/core').ShikoNode<unknown>, prefix: string): import('@shiko/core').ShikoNode<unknown> {
+  return copyNode(node, {
+    id: `${prefix}${node.id}`,
+    children: node.children.map((child) => prefixNodeIds(child, prefix)),
+  });
 }
 
 const { contextMenu, closeContextMenu, onNodeContextMenu } =

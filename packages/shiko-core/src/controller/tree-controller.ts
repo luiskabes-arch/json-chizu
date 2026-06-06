@@ -18,6 +18,14 @@ export class ShikoTreeController<T = unknown> extends ListenableStore {
   private readonly hidden = new Set<string>();
   private readonly hiddenGroups = new Map<string, Set<string>>();
   private readonly expandedTextRows = new Set<string>();
+  private readonly expandedJsonRows = new Set<string>();
+  /**
+   * Dynamically injected child nodes from parsed JSON strings.
+   * Key: `${parentNodeId}::${rowKey}`, Value: the synthetic ShikoNode.
+   * The parent is expected to have the injected node listed in its children
+   * only virtually — the layout picks it up via visibleNodes().
+   */
+  private readonly injectedNodes = new Map<string, ShikoNode<T>>();
 
   private _treeRevision = 0;
   private _expansionRevision = 0;
@@ -61,11 +69,22 @@ export class ShikoTreeController<T = unknown> extends ListenableStore {
     return this.expandedTextRows;
   }
 
+  get expandedJsonRowIds(): ReadonlySet<string> {
+    return this.expandedJsonRows;
+  }
+
+  /** All currently injected synthetic nodes, keyed by `parentId::rowKey`. */
+  get injectedNodeMap(): ReadonlyMap<string, ShikoNode<T>> {
+    return this.injectedNodes;
+  }
+
   setRoot(root: ShikoNode<T>): void {
     this._root = root;
     this.hidden.clear();
     this.hiddenGroups.clear();
     this.expandedTextRows.clear();
+    this.expandedJsonRows.clear();
+    this.injectedNodes.clear();
     this._treeRevision += 1;
     this.emit();
   }
@@ -83,6 +102,54 @@ export class ShikoTreeController<T = unknown> extends ListenableStore {
 
   isTextRowExpanded(nodeId: string, rowKey: string): boolean {
     return this.expandedTextRows.has(`${nodeId}::${rowKey}`);
+  }
+
+  /**
+   * Injects a parsed JSON node as a synthetic child of `parentNodeId`.
+   * The injected node is also auto-expanded and the parent is auto-expanded.
+   * Calling again with the same key replaces the previous node.
+   */
+  injectJsonNode(parentNodeId: string, rowKey: string, node: ShikoNode<T>): void {
+    const key = `${parentNodeId}::${rowKey}`;
+    this.injectedNodes.set(key, node);
+    this.expandedJsonRows.add(key);
+    // Auto-expand the parent so the injected child is visible
+    this.expanded.add(parentNodeId);
+    // Also auto-expand the injected node itself so its children are traversable and visible
+    this.expanded.add(node.id);
+    this._expansionRevision += 1;
+    this.emit();
+  }
+
+  /**
+   * Removes the injected node for `parentNodeId::rowKey` and collapses it.
+   */
+  removeInjectedJsonNode(parentNodeId: string, rowKey: string): void {
+    const key = `${parentNodeId}::${rowKey}`;
+    const node = this.injectedNodes.get(key);
+    if (!node) return;
+    this.injectedNodes.delete(key);
+    this.expandedJsonRows.delete(key);
+    this.expanded.delete(node.id);
+    this._expansionRevision += 1;
+    this.emit();
+  }
+
+  /**
+   * Toggles the injected JSON node. When collapsing, removes the injected node.
+   * When expanding, callers must call `injectJsonNode` instead (since they need to
+   * supply the parsed node). This method only handles collapse.
+   */
+  toggleJsonRowExpansion(nodeId: string, rowKey: string): void {
+    const rowId = `${nodeId}::${rowKey}`;
+    if (this.expandedJsonRows.has(rowId)) {
+      this.removeInjectedJsonNode(nodeId, rowKey);
+    }
+    // Expansion is handled by injectJsonNode called from the click handler
+  }
+
+  isJsonRowExpanded(nodeId: string, rowKey: string): boolean {
+    return this.expandedJsonRows.has(`${nodeId}::${rowKey}`);
   }
 
   isExpanded(nodeId: string): boolean {
@@ -227,12 +294,50 @@ export class ShikoTreeController<T = unknown> extends ListenableStore {
     this.emit();
   }
 
+  /**
+   * Returns the list of visible nodes, including any injected synthetic nodes.
+   * Injected nodes appear as direct children of their parent in the layout.
+   */
   visibleNodes(): ShikoNode<T>[] {
     if (!this._root) {
       return [];
     }
 
-    return flattenVisible(this._root, this.expanded, this.hidden, this.hiddenGroups);
+    // Build a virtual tree that includes injected nodes as children of their parents
+    const injected = this.injectedNodes;
+    if (injected.size === 0) {
+      return flattenVisible(this._root, this.expanded, this.hidden, this.hiddenGroups);
+    }
+
+    // Build a parent-id → injected node array map
+    const injectedByParent = new Map<string, ShikoNode<T>[]>();
+    for (const [key, node] of injected) {
+      const sep = key.indexOf("::");
+      if (sep < 0) continue;
+      const parentId = key.slice(0, sep);
+      let list = injectedByParent.get(parentId);
+      if (!list) {
+        list = [];
+        injectedByParent.set(parentId, list);
+      }
+      list.push(node);
+    }
+
+    // Flatten visible nodes and splice in injected nodes after each parent
+    const base = flattenVisible(this._root, this.expanded, this.hidden, this.hiddenGroups);
+    const result: ShikoNode<T>[] = [];
+    for (const node of base) {
+      result.push(node);
+      const extraChildren = injectedByParent.get(node.id);
+      if (extraChildren && this.expanded.has(node.id)) {
+        for (const child of extraChildren) {
+          // Also recursively flatten the injected node's own visible descendants
+          const childVisible = flattenVisible(child, this.expanded, this.hidden, this.hiddenGroups);
+          result.push(...childVisible);
+        }
+      }
+    }
+    return result;
   }
 
   getParentId(nodeId: string): string | null {
@@ -240,7 +345,27 @@ export class ShikoTreeController<T = unknown> extends ListenableStore {
       return null;
     }
 
+    // Check injected nodes first
+    for (const [key, node] of this.injectedNodes) {
+      if (node.id === nodeId) {
+        const sep = key.indexOf("::");
+        if (sep >= 0) return key.slice(0, sep);
+      }
+      // Check descendants of injected nodes
+      const found = findInInjected(node, nodeId);
+      if (found) return found;
+    }
+
     const parent = findParent(this._root, nodeId);
     return parent?.id ?? null;
   }
+}
+
+function findInInjected<T>(node: ShikoNode<T>, targetId: string): string | null {
+  for (const child of node.children) {
+    if (child.id === targetId) return node.id;
+    const deeper = findInInjected(child, targetId);
+    if (deeper) return deeper;
+  }
+  return null;
 }
