@@ -51,6 +51,8 @@ import {
   drawGraphCanvas,
   extractFontFamily,
   estimateNodeSize,
+  computeNodeRowExpandZones,
+  hitTestRowExpandZones,
 } from "../utils/renderUtils";
 
 interface CanvasProps {
@@ -275,6 +277,23 @@ function resolveCursorForHit(local: Point, hit: string | null): CanvasCursor {
         return "pointer";
       }
     }
+
+    // Check per-row expand buttons in the body
+    if (viewport.scale >= 0.36) {
+      const screenHeight = size.height * viewport.scale;
+      const rowZones = computeNodeRowExpandZones(
+        node,
+        screenPos,
+        screenWidth,
+        screenHeight,
+        viewport.scale,
+        props.font,
+        tree.expandedTextRowIds,
+      );
+      if (hitTestRowExpandZones(local.x, local.y, rowZones) !== null) {
+        return "pointer";
+      }
+    }
   }
 
   return "pointer";
@@ -318,7 +337,7 @@ async function rebuildLayoutInternal(layoutRunId: number): Promise<void> {
       }
 
       idToNode.set(node.id, node);
-      sizes.set(node.id, estimateNodeSize(node, props.font, props.nodeSize));
+      sizes.set(node.id, estimateNodeSize(node, props.font, props.nodeSize, tree.expandedTextRowIds));
       processed += 1;
 
       if (processed % props.layoutChunkSize === 0) {
@@ -339,7 +358,7 @@ async function rebuildLayoutInternal(layoutRunId: number): Promise<void> {
   } else {
     for (const node of visibleNodes) {
       idToNode.set(node.id, node);
-      sizes.set(node.id, estimateNodeSize(node, props.font, props.nodeSize));
+      sizes.set(node.id, estimateNodeSize(node, props.font, props.nodeSize, tree.expandedTextRowIds));
     }
   }
 
@@ -529,6 +548,10 @@ function drawCanvas(): void {
     textColor: props.textColor,
     canvasColors: props.canvasColors,
     font: props.font,
+    expandedIds: tree.expandedIds,
+    expandedTextRowIds: tree.expandedTextRowIds,
+    hiddenIds: tree.hiddenIds,
+    hiddenGroupKeys: tree.hiddenGroupKeys,
   });
 }
 
@@ -668,6 +691,35 @@ function onClick(event: MouseEvent): void {
       if (iconHit === "expand") {
         event.stopPropagation();
         tree.toggleExpansion(hit);
+        dragDistance = 0;
+        return;
+      }
+    }
+
+    // Check per-row expand buttons in the body area
+    if (viewport.scale >= 0.36) {
+      const screenHeight = size.height * viewport.scale;
+      const rowZones = computeNodeRowExpandZones(
+        node,
+        screenPos,
+        screenWidth,
+        screenHeight,
+        viewport.scale,
+        props.font,
+        tree.expandedTextRowIds,
+      );
+      const rowZone = hitTestRowExpandZones(local.x, local.y, rowZones);
+      if (rowZone !== null) {
+        event.stopPropagation();
+        if (rowZone.isTextToggle && rowZone.rowKey) {
+          tree.toggleTextRowExpansion(node.id, rowZone.rowKey);
+        } else if (rowZone.isExpansionToggle) {
+          tree.toggleExpansion(rowZone.childId);
+        } else if (rowZone.isGroupToggle && rowZone.groupKey) {
+          tree.toggleHiddenGroup(rowZone.childId, rowZone.groupKey);
+        } else {
+          tree.toggleHidden(rowZone.childId);
+        }
         dragDistance = 0;
         return;
       }

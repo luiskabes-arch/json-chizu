@@ -338,14 +338,33 @@ function pushRootChildren(
     const entries = Object.entries(value);
     for (let i = entries.length - 1; i >= 0; i -= 1) {
       const [key, childValue] = entries[i]!;
-      stack.push({
-        key,
-        edgeLabel: key,
-        value: childValue,
-        parent,
-        depth,
-        path: isIdentifier(key) ? `${parentPath}.${key}` : `${parentPath}["${key.replace(/"/g, '\\"')}"]`,
-      });
+      if (Array.isArray(childValue)) {
+        for (let j = childValue.length - 1; j >= 0; j -= 1) {
+          const indexToken = `[${j}]`;
+          const edgeLabel = `${key}${indexToken}`;
+          const itemPath = isIdentifier(key)
+            ? `${parentPath}.${key}${indexToken}`
+            : `${parentPath}["${key.replace(/"/g, '\\"')}"]${indexToken}`;
+
+          stack.push({
+            key: indexToken,
+            edgeLabel,
+            value: childValue[j],
+            parent,
+            depth,
+            path: itemPath,
+          });
+        }
+      } else {
+        stack.push({
+          key,
+          edgeLabel: key,
+          value: childValue,
+          parent,
+          depth,
+          path: isIdentifier(key) ? `${parentPath}.${key}` : `${parentPath}["${key.replace(/"/g, '\\"')}"]`,
+        });
+      }
     }
   }
 }
@@ -394,14 +413,33 @@ function pushObjectContainerChildren(
       continue;
     }
 
-    stack.push({
-      key,
-      edgeLabel: key,
-      value: childValue,
-      parent,
-      depth,
-      path: isIdentifier(key) ? `${parentPath}.${key}` : `${parentPath}["${key.replace(/"/g, '\\"')}"]`,
-    });
+    if (Array.isArray(childValue)) {
+      for (let j = childValue.length - 1; j >= 0; j -= 1) {
+        const indexToken = `[${j}]`;
+        const edgeLabel = `${key}${indexToken}`;
+        const itemPath = isIdentifier(key)
+          ? `${parentPath}.${key}${indexToken}`
+          : `${parentPath}["${key.replace(/"/g, '\\"')}"]${indexToken}`;
+
+        stack.push({
+          key: indexToken,
+          edgeLabel,
+          value: childValue[j],
+          parent,
+          depth,
+          path: itemPath,
+        });
+      }
+    } else {
+      stack.push({
+        key,
+        edgeLabel: key,
+        value: childValue,
+        parent,
+        depth,
+        path: isIdentifier(key) ? `${parentPath}.${key}` : `${parentPath}["${key.replace(/"/g, '\\"')}"]`,
+      });
+    }
   }
 }
 
@@ -417,8 +455,10 @@ function addTruncatedNode(parent: MutableNode, reason: string): void {
 
 function formatLabel(key: string, value: unknown, maxLength: number): string {
   if (Array.isArray(value)) {
+    // The key is already shown in the node header (edgeLabel) and the parent's
+    // body row, so omit the prefix here to avoid "content: { content: [1 item] }".
     const label = value.length === 1 ? "item" : "items";
-    return `${key}: [${value.length} ${label}]`;
+    return `[${value.length} ${label}]`;
   }
 
   if (isPlainObject(value)) {

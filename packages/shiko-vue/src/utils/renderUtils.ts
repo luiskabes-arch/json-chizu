@@ -1,3 +1,4 @@
+import { getGroupBaseKey } from "@shiko/core";
 import type { Size, Point, Rect, ShikoNode, ShikoSelectionController, ShikoViewportController, GridSpatialIndex } from "@shiko/core";
 import { drawCanvasIcon } from "./canvasIcons";
 
@@ -46,6 +47,28 @@ export interface NodeHeaderIconZones {
   eye: { x: number; y: number; w: number; h: number };
   info: { x: number; y: number; w: number; h: number };
   expand: { x: number; y: number; w: number; h: number } | null;
+}
+
+/**
+ * A clickable expand/collapse zone for a single body row that maps to a child node.
+ */
+export interface RowExpandZone {
+  /** The ID of the node this button controls. */
+  childId: string;
+  /**
+   * When true the button toggles the node's own EXPANSION (used for array
+   * nodes whose body line summarises the node itself). When false it toggles
+   * hidden-state of the child node card.
+   */
+  isExpansionToggle: boolean;
+  isGroupToggle?: boolean;
+  groupKey?: string;
+  isTextToggle?: boolean;
+  rowKey?: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
 }
 
 /**
@@ -381,34 +404,307 @@ export function getTemplateFontSizePx(fontTemplate: string): number | null {
   return parsed;
 }
 
-export function estimateNodeSize(node: ShikoNode<unknown>, font: string, defaultNodeSize: Size): Size {
+let sharedMeasurerContext: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null = null;
+
+export function getMeasurerContext(): CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null {
+  if (sharedMeasurerContext) return sharedMeasurerContext;
+  if (typeof OffscreenCanvas !== "undefined") {
+    sharedMeasurerContext = new OffscreenCanvas(1, 1).getContext("2d");
+  } else if (typeof document !== "undefined") {
+    const canvas = document.createElement("canvas");
+    sharedMeasurerContext = canvas.getContext("2d");
+  }
+  return sharedMeasurerContext;
+}
+
+export function wrapTextHelper(
+  ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null,
+  text: string,
+  firstLineMaxWidth: number,
+  otherLinesMaxWidth: number,
+  fontSize: number,
+  avgCharWidth: number,
+): string[] {
+  if (!text) return [];
+
+  const measureWidth = (str: string): number => {
+    if (ctx) {
+      return ctx.measureText(str).width;
+    }
+    return str.length * avgCharWidth;
+  };
+
+  const lines: string[] = [];
+  let currentLine = "";
+  let isFirstLine = true;
+
+  const words = text.split(/(\s+)/);
+
+  for (const word of words) {
+    if (!word) continue;
+
+    const limit = isFirstLine ? firstLineMaxWidth : otherLinesMaxWidth;
+    const testLine = currentLine + word;
+
+    if (measureWidth(testLine) <= limit) {
+      currentLine = testLine;
+    } else {
+      if (measureWidth(word) > limit) {
+        for (let i = 0; i < word.length; i++) {
+          const char = word[i]!;
+          const testCharLine = currentLine + char;
+          const currentLimit = isFirstLine ? firstLineMaxWidth : otherLinesMaxWidth;
+          if (measureWidth(testCharLine) <= currentLimit) {
+            currentLine = testCharLine;
+          } else {
+            if (currentLine) {
+              lines.push(currentLine);
+              isFirstLine = false;
+            }
+            currentLine = char;
+          }
+        }
+      } else {
+        if (currentLine) {
+          lines.push(currentLine);
+          isFirstLine = false;
+        }
+        currentLine = word.trimStart() === "" ? "" : word;
+      }
+    }
+  }
+
+  if (currentLine) {
+    lines.push(currentLine);
+  }
+
+  return lines;
+}
+
+export function getWrappedLinesForValue(
+  ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null,
+  value: string,
+  valueWidth: number,
+  fontSize: number,
+  avgCharWidth: number,
+): string[] {
+  const wrapped = wrapTextHelper(ctx, value, valueWidth, valueWidth, fontSize, avgCharWidth);
+  if (wrapped.length > 4) {
+    const lastLine = wrapped[wrapped.length - 1] || "";
+    const suffix = " (show less)";
+    let lastLineWidth = 0;
+    let suffixWidth = 0;
+    if (ctx) {
+      lastLineWidth = ctx.measureText(lastLine).width;
+      suffixWidth = ctx.measureText(suffix).width;
+    } else {
+      lastLineWidth = lastLine.length * avgCharWidth;
+      suffixWidth = suffix.length * avgCharWidth;
+    }
+    if (lastLineWidth + suffixWidth > valueWidth) {
+      return [...wrapped, ""];
+    }
+  }
+  return wrapped;
+}
+
+export function truncateLineWithSuffix(
+  context: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null,
+  text: string,
+  suffix: string,
+  maxWidth: number,
+  avgCharWidth: number,
+): { text: string; suffixXOffset: number } {
+  const suffixWidth = context ? context.measureText(suffix).width : suffix.length * avgCharWidth;
+  if (suffixWidth >= maxWidth) {
+    return { text: "", suffixXOffset: 0 };
+  }
+  const allowedWidth = maxWidth - suffixWidth;
+
+  let low = 0;
+  let high = text.length;
+  let bestLen = 0;
+
+  const measure = (str: string): number => {
+    return context ? context.measureText(str).width : str.length * avgCharWidth;
+  };
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const candidate = text.slice(0, mid);
+    if (measure(candidate) <= allowedWidth) {
+      bestLen = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  const truncatedText = text.slice(0, bestLen);
+  const suffixXOffset = measure(truncatedText);
+  return { text: truncatedText, suffixXOffset };
+}
+
+export function formatValueSummary(value: unknown): string {
+  if (Array.isArray(value)) {
+    const label = value.length === 1 ? "item" : "items";
+    return `[${value.length} ${label}]`;
+  }
+  if (value !== null && typeof value === "object") {
+    const size = Object.keys(value).length;
+    const label = size === 1 ? "key" : "keys";
+    return `{${size} ${label}}`;
+  }
+  if (value === null) {
+    return "null";
+  }
+  return String(value);
+}
+
+export function getRowUntruncatedValue(node: ShikoNode<unknown>, line: string, i: number): string {
+  const separatorIndex = line.indexOf(":");
+  if (separatorIndex <= 0) {
+    const val = node.data && typeof node.data === "object" && "value" in node.data
+      ? (node.data as any).value
+      : null;
+    return val !== null && val !== undefined ? formatValueSummary(val) : line;
+  }
+
+  const keyPart = line.slice(0, separatorIndex).trim();
+  const valObj = node.data && typeof node.data === "object" && "value" in node.data
+    ? (node.data as any).value
+    : null;
+
+  if (valObj && typeof valObj === "object") {
+    const actualVal = (valObj as any)[keyPart];
+    if (actualVal !== undefined) {
+      return formatValueSummary(actualVal);
+    }
+  }
+
+  return line.slice(separatorIndex + 1).trimStart();
+}
+
+export function getWrappedLinesCount(
+  ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null,
+  node: ShikoNode<unknown>,
+  line: string,
+  i: number,
+  maxTextWidth: number,
+  fontSize: number,
+  avgCharWidth: number,
+): number {
+  const untruncatedVal = getRowUntruncatedValue(node, line, i);
+  const separatorIndex = line.indexOf(":");
+  if (separatorIndex <= 0) {
+    const wrapped = getWrappedLinesForValue(ctx, untruncatedVal, maxTextWidth, fontSize, avgCharWidth);
+    return Math.max(1, wrapped.length);
+  }
+
+  const keyPart = line.slice(0, separatorIndex + 1);
+  const keyDisplay = `${keyPart} `;
+
+  let keyWidth = 0;
+  if (ctx) {
+    keyWidth = ctx.measureText(keyDisplay).width;
+  } else {
+    keyWidth = keyDisplay.length * avgCharWidth;
+  }
+
+  if (keyWidth >= maxTextWidth - 6) {
+    const wrapped = getWrappedLinesForValue(ctx, untruncatedVal, maxTextWidth, fontSize, avgCharWidth);
+    return Math.max(1, wrapped.length);
+  }
+
+  const valueWidth = Math.max(1, maxTextWidth - keyWidth);
+  const wrapped = getWrappedLinesForValue(ctx, untruncatedVal, valueWidth, fontSize, avgCharWidth);
+  return Math.max(1, wrapped.length);
+}
+
+export function estimateNodeSize(
+  node: ShikoNode<unknown>,
+  font: string,
+  defaultNodeSize: Size,
+  expandedTextRows?: ReadonlySet<string>,
+): Size {
   const label = node.label ?? node.id;
   const lines = label.split("\n").filter((line) => line.trim().length > 0);
-  const bodyLineCount = (() => {
-    if (lines.length > 1 && isArrayItemHeaderLine(lines[0]!)) {
-      return lines.length - 1;
-    }
-    return lines.length;
-  })();
-  const visibleLineCount = Math.max(1, Math.min(10, bodyLineCount));
-  const longestLineLength = lines.reduce((maxLength, line) => {
-    return Math.max(maxLength, line.length);
-  }, 0);
+  const firstLineIsItemHeader = lines.length > 1 && isArrayItemHeaderLine(lines[0]!);
+  const bodyLines = firstLineIsItemHeader ? lines.slice(1) : lines;
 
   const fontSize = getTemplateFontSizePx(font) ?? 13;
-  // Use the same row height as the table rendering
   const rowHeight = Math.max(fontSize + 6, fontSize * 1.55);
   const avgCharWidth = Math.max(6.2, fontSize * 0.54);
 
   const horizontalPadding = 14;
 
-  const estimatedWidth = horizontalPadding * 2 + longestLineLength * avgCharWidth;
-  const estimatedHeight = NODE_HEADER_WORLD_HEIGHT + visibleLineCount * rowHeight;
+  const hasWrappedLines = bodyLines.some((line, i) => {
+    const untruncated = getRowUntruncatedValue(node, line, i);
+    return untruncated.length * avgCharWidth > defaultNodeSize.width - horizontalPadding * 2 - 60;
+  });
+  const hasButtons = node.children.length > 0 || hasWrappedLines;
+  const rowBtnReserve = hasButtons
+    ? Math.max(5, 5.5) * 2 + (6 + 4)
+    : 0;
+
+  const ctx = getMeasurerContext();
+  if (ctx) {
+    ctx.font = buildNodeFont(fontSize, font);
+  }
+
+  let maxLineWidth = defaultNodeSize.width;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    let w = 0;
+    const isBodyLine = !firstLineIsItemHeader || i > 0;
+    if (isBodyLine) {
+      const separatorIndex = line.indexOf(":");
+      if (separatorIndex > 0) {
+        const keyPart = line.slice(0, separatorIndex + 1);
+        const keyDisplay = `${keyPart} `;
+        const untruncatedVal = getRowUntruncatedValue(node, line, firstLineIsItemHeader ? i - 1 : i);
+        let kw = 0;
+        let vw = 0;
+        if (ctx) {
+          kw = ctx.measureText(keyDisplay).width;
+          vw = ctx.measureText(untruncatedVal).width;
+        } else {
+          kw = keyDisplay.length * avgCharWidth;
+          vw = untruncatedVal.length * avgCharWidth;
+        }
+        w = kw + vw;
+      } else {
+        w = ctx ? ctx.measureText(line).width : line.length * avgCharWidth;
+      }
+    } else {
+      w = ctx ? ctx.measureText(line).width : line.length * avgCharWidth;
+    }
+    const neededWidth = w + horizontalPadding * 2 + rowBtnReserve;
+    if (neededWidth > maxLineWidth) {
+      maxLineWidth = neededWidth;
+    }
+  }
+
+  const nodeWidth = Math.max(defaultNodeSize.width, Math.min(600, Math.ceil(maxLineWidth)));
+  const maxTextWidth = nodeWidth - horizontalPadding * 2 - rowBtnReserve;
+
+  let totalBodyLines = 0;
+  for (let i = 0; i < bodyLines.length; i++) {
+    const line = bodyLines[i]!;
+    const rowKey = parseRowKey(line) || `row-${i}`;
+    const rowId = `${node.id}::${rowKey}`;
+    const isRowExpanded = expandedTextRows?.has(rowId) ?? false;
+
+    const wrappedLinesCount = getWrappedLinesCount(ctx, node, line, i, maxTextWidth, fontSize, avgCharWidth);
+    const finalRowLines = isRowExpanded ? wrappedLinesCount : Math.min(4, wrappedLinesCount);
+    totalBodyLines += finalRowLines;
+  }
+
+  const estimatedHeight = NODE_HEADER_WORLD_HEIGHT + totalBodyLines * rowHeight;
 
   return {
-    width: Math.max(defaultNodeSize.width, Math.min(360, Math.ceil(estimatedWidth))),
-    // Add a tiny buffer (1px) to prevent float inaccuracies when dividing back down
-    height: Math.max(defaultNodeSize.height, Math.min(240, Math.ceil(estimatedHeight) + 1)),
+    width: nodeWidth,
+    height: Math.max(defaultNodeSize.height, Math.min(2000, Math.ceil(estimatedHeight) + 1)),
   };
 }
 
@@ -556,6 +852,277 @@ export interface RenderCanvasOptions {
   textColor: string;
   font: string;
   canvasColors?: CanvasColors | undefined;
+  expandedIds?: ReadonlySet<string>;
+  expandedTextRowIds?: ReadonlySet<string>;
+  hiddenIds?: ReadonlySet<string>;
+  hiddenGroupKeys?: ReadonlyMap<string, ReadonlySet<string>>;
+}
+
+/**
+ * Parses the key from a label line like "details: {2 keys}" → "details".
+ * Returns null if no colon separator is found at a valid position.
+ */
+function parseRowKey(line: string): string | null {
+  const idx = line.indexOf(":");
+  if (idx <= 0) return null;
+  return line.slice(0, idx).trim();
+}
+
+/**
+ * Returns true if a label line represents an expandable value summary.
+ * e.g. "details: {2 keys}" or "items: [5 items]"
+ */
+function isExpandableLine(line: string): boolean {
+  const trimmed = line.trim();
+  // Bare array summary (array nodes, no key prefix) — e.g. "[2 items]"
+  if (/^\[\d+ items?\]$/.test(trimmed)) return true;
+  const idx = trimmed.indexOf(":");
+  if (idx <= 0) return false;
+  const val = trimmed.slice(idx + 1).trim();
+  return /^\{\d+ keys?\}$/.test(val) || /^\[\d+ items?\]$/.test(val);
+}
+
+/**
+ * Computes the screen-space hit zones for per-row expand buttons.
+ * Returns one zone per body row that corresponds to an expandable child node.
+ */
+export function computeNodeRowExpandZones(
+  node: ShikoNode<unknown>,
+  screenPos: Point,
+  screenWidth: number,
+  screenHeight: number,
+  scale: number,
+  font: string,
+  expandedTextRows?: ReadonlySet<string>,
+): RowExpandZone[] {
+  const label = node.label ?? node.id;
+  const lines = label.split("\n").filter((l) => l.trim().length > 0);
+
+  const worldFontSize = getTemplateFontSizePx(font) ?? 13;
+  const worldRowHeight = Math.max(worldFontSize + 6, worldFontSize * 1.55);
+  const rowHeight = worldRowHeight * scale;
+  const headerH = NODE_HEADER_WORLD_HEIGHT * scale;
+  const bodyStartY = screenPos.y + headerH;
+  const bodyHeight = screenHeight - headerH;
+
+  const firstLineIsItemHeader = lines.length > 1 && isArrayItemHeaderLine(lines[0]!);
+  const bodyLines = firstLineIsItemHeader ? lines.slice(1) : lines;
+
+  const ctx = getMeasurerContext();
+  if (ctx) {
+    ctx.font = buildNodeFont(worldFontSize * scale, font);
+  }
+
+  const horizontalPadding = 14 * scale;
+  const rowBtnReserve = node.children.length > 0
+    ? Math.max(5, 5.5 * scale) * 2 + (6 + 4) * scale
+    : 0;
+  const maxTextWidth = screenWidth - horizontalPadding - horizontalPadding - rowBtnReserve;
+
+  const edgeLabelToChild = new Map<string, string>();
+  const childGroupKeys = new Set<string>();
+  for (const child of node.children) {
+    if (child.edgeLabel !== undefined) {
+      edgeLabelToChild.set(child.edgeLabel, child.id);
+      const baseKey = getGroupBaseKey(child.edgeLabel);
+      if (baseKey) {
+        childGroupKeys.add(baseKey);
+      }
+    }
+  }
+
+  const rowLinesCount: number[] = [];
+  const wrappedLinesLists: string[][] = [];
+  const keyWidthsList: number[] = [];
+  const valueWidthsList: number[] = [];
+  let totalBodyLines = 0;
+
+  for (let i = 0; i < bodyLines.length; i++) {
+    const line = bodyLines[i]!;
+    const rowKey = parseRowKey(line) || `row-${i}`;
+    const rowId = `${node.id}::${rowKey}`;
+    const isRowExpanded = expandedTextRows?.has(rowId) ?? false;
+
+    const untruncatedVal = getRowUntruncatedValue(node, line, i);
+    const separatorIndex = line.indexOf(":");
+    let wrapped: string[] = [];
+    let keyWidth = 0;
+    let valueWidth = maxTextWidth;
+    if (separatorIndex <= 0) {
+      wrapped = getWrappedLinesForValue(ctx, untruncatedVal, maxTextWidth, worldFontSize * scale, Math.max(6.2, worldFontSize * 0.54) * scale);
+    } else {
+      const keyPart = line.slice(0, separatorIndex + 1);
+      const keyDisplay = `${keyPart} `;
+      if (ctx) {
+        keyWidth = ctx.measureText(keyDisplay).width;
+      } else {
+        keyWidth = keyDisplay.length * Math.max(6.2, worldFontSize * 0.54) * scale;
+      }
+
+      if (keyWidth >= maxTextWidth - 6) {
+        wrapped = getWrappedLinesForValue(ctx, untruncatedVal, maxTextWidth, worldFontSize * scale, Math.max(6.2, worldFontSize * 0.54) * scale);
+        keyWidth = 0;
+      } else {
+        valueWidth = Math.max(1, maxTextWidth - keyWidth);
+        wrapped = getWrappedLinesForValue(ctx, untruncatedVal, valueWidth, worldFontSize * scale, Math.max(6.2, worldFontSize * 0.54) * scale);
+      }
+    }
+
+    const count = Math.max(1, wrapped.length);
+    const finalCount = isRowExpanded ? count : Math.min(4, count);
+    rowLinesCount.push(finalCount);
+    wrappedLinesLists.push(wrapped);
+    keyWidthsList.push(keyWidth);
+    valueWidthsList.push(valueWidth);
+    totalBodyLines += finalCount;
+  }
+
+  const totalRowsHeight = totalBodyLines * rowHeight;
+  const blockStartY = bodyStartY + (bodyHeight - totalRowsHeight) / 2;
+
+  const btnRadius = Math.max(5, 5.5 * scale);
+  const btnDiameter = btnRadius * 2;
+  const rightPad = 6 * scale;
+  const btnCx = screenPos.x + screenWidth - rightPad - btnRadius;
+
+  const zones: RowExpandZone[] = [];
+  let currentLinesOffset = 0;
+
+  for (let i = 0; i < bodyLines.length; i++) {
+    const line = bodyLines[i]!;
+    const rowKey = parseRowKey(line) || `row-${i}`;
+    const wrapped = wrappedLinesLists[i]!;
+    const wrappedLinesCount = Math.max(1, wrapped.length);
+    const keyWidth = keyWidthsList[i]!;
+    const valueWidth = valueWidthsList[i]!;
+
+    const rowTop = blockStartY + currentLinesOffset * rowHeight;
+    const rowCenterY = rowTop + rowHeight / 2;
+    const zoneBase = {
+      x: btnCx - btnRadius,
+      y: rowCenterY - btnRadius,
+      w: btnDiameter,
+      h: btnDiameter,
+    };
+
+    if (isExpandableLine(line)) {
+      const key = parseRowKey(line);
+      if (key !== null) {
+        const childId = edgeLabelToChild.get(key);
+        if (childId !== undefined) {
+          zones.push({ childId, isExpansionToggle: false, ...zoneBase });
+        } else if (childGroupKeys.has(key)) {
+          zones.push({
+            childId: node.id,
+            isExpansionToggle: false,
+            isGroupToggle: true,
+            groupKey: key,
+            ...zoneBase,
+          });
+        } else if (node.edgeLabel === key && node.children.length > 0) {
+          zones.push({ childId: node.id, isExpansionToggle: true, ...zoneBase });
+        }
+      } else {
+        if (node.children.length > 0) {
+          zones.push({ childId: node.id, isExpansionToggle: true, ...zoneBase });
+        }
+      }
+    } else if (wrappedLinesCount > 4) {
+      zones.push({
+        childId: node.id,
+        isExpansionToggle: false,
+        isTextToggle: true,
+        rowKey,
+        x: screenPos.x + horizontalPadding + keyWidth,
+        y: rowTop,
+        w: valueWidth,
+        h: rowLinesCount[i]! * rowHeight,
+      });
+    }
+
+    currentLinesOffset += rowLinesCount[i]!;
+  }
+
+  return zones;
+}
+
+/**
+ * Returns the matching RowExpandZone if a screen-space point hits one, else null.
+ */
+export function hitTestRowExpandZones(
+  px: number,
+  py: number,
+  zones: RowExpandZone[],
+): RowExpandZone | null {
+  for (const zone of zones) {
+    if (px >= zone.x && px <= zone.x + zone.w && py >= zone.y && py <= zone.y + zone.h) {
+      return zone;
+    }
+  }
+  return null;
+}
+
+/**
+ * Draws the per-row expand/collapse circle buttons for a node's body rows.
+ * - isExpansionToggle zones: '-' when expanded (childId in expandedIds), '+' when collapsed.
+ * - hide-child zones: '-' when visible (childId NOT in hiddenIds), '+' when hidden.
+ */
+export function drawNodeRowExpandButtons(
+  context: CanvasRenderingContext2D,
+  zones: RowExpandZone[],
+  hiddenIds: ReadonlySet<string>,
+  expandedIds: ReadonlySet<string>,
+  scale: number,
+  iconColor: string,
+  hiddenGroupKeys?: ReadonlyMap<string, ReadonlySet<string>>,
+  expandedTextRowIds?: ReadonlySet<string>,
+): void {
+  if (zones.length === 0) return;
+
+  const btnRadius = Math.max(5, 5.5 * scale);
+  const lineW = Math.max(0.8, 1.2 * scale);
+  const armLen = Math.max(2.5, 3 * scale);
+
+  for (const zone of zones) {
+    if (zone.isTextToggle) {
+      continue;
+    }
+    const cx = zone.x + zone.w / 2;
+    const cy = zone.y + zone.h / 2;
+
+    let showMinus = true;
+    if (zone.isTextToggle && zone.rowKey) {
+      showMinus = expandedTextRowIds?.has(`${zone.childId}::${zone.rowKey}`) ?? false;
+    } else if (zone.isExpansionToggle) {
+      showMinus = expandedIds.has(zone.childId);
+    } else if (zone.isGroupToggle && zone.groupKey) {
+      const isHidden = hiddenGroupKeys?.get(zone.childId)?.has(zone.groupKey) ?? false;
+      showMinus = !isHidden;
+    } else {
+      showMinus = !hiddenIds.has(zone.childId);
+    }
+
+    // Circle outline
+    context.beginPath();
+    context.arc(cx, cy, btnRadius, 0, Math.PI * 2);
+    context.strokeStyle = iconColor;
+    context.lineWidth = lineW;
+    context.stroke();
+
+    // Minus arm (horizontal bar — always drawn)
+    context.beginPath();
+    context.moveTo(cx - armLen, cy);
+    context.lineTo(cx + armLen, cy);
+    context.stroke();
+
+    // Plus arm (vertical bar — only when showing '+')
+    if (!showMinus) {
+      context.beginPath();
+      context.moveTo(cx, cy - armLen);
+      context.lineTo(cx, cy + armLen);
+      context.stroke();
+    }
+  }
 }
 
 export function drawGraphCanvas(options: RenderCanvasOptions): void {
@@ -575,6 +1142,10 @@ export function drawGraphCanvas(options: RenderCanvasOptions): void {
     textColor,
     font,
     canvasColors,
+    expandedIds,
+    expandedTextRowIds,
+    hiddenIds,
+    hiddenGroupKeys,
   } = options;
 
   const colors: CanvasColors = canvasColors ?? DEFAULT_CANVAS_COLORS;
@@ -626,11 +1197,62 @@ export function drawGraphCanvas(options: RenderCanvasOptions): void {
       continue;
     }
 
-    // Connect from the right edge center of the parent
-    const fromRightW = {
-      x: fromPos.x + fromSize.width,
-      y: fromPos.y + fromSize.height / 2,
-    };
+    // Connect from the right edge, matching the child's key row if possible
+    const label = node.label ?? node.id;
+    const lines = label.split("\n").filter((l) => l.trim().length > 0);
+    const worldFontSize = getTemplateFontSizePx(font) ?? 13;
+    const worldRowHeight = Math.max(worldFontSize + 6, worldFontSize * 1.55);
+    const worldBodyStartY = NODE_HEADER_WORLD_HEIGHT;
+    const worldBodyHeight = fromSize.height - NODE_HEADER_WORLD_HEIGHT;
+
+    const firstLineIsItemHeader = lines.length > 1 && isArrayItemHeaderLine(lines[0]!);
+    const bodyLines = firstLineIsItemHeader ? lines.slice(1) : lines;
+
+    const ctx = getMeasurerContext();
+    if (ctx) {
+      ctx.font = buildNodeFont(worldFontSize, font);
+    }
+    const horizontalPadding = 14;
+    const rowBtnReserve = node.children.length > 0
+      ? Math.max(5, 5.5) * 2 + (6 + 4)
+      : 0;
+    const maxTextWidth = fromSize.width - horizontalPadding * 2 - rowBtnReserve;
+
+    const rowLinesCount: number[] = [];
+    let totalBodyLines = 0;
+    for (let i = 0; i < bodyLines.length; i++) {
+      const line = bodyLines[i]!;
+      const rowKey = parseRowKey(line) || `row-${i}`;
+      const rowId = `${node.id}::${rowKey}`;
+      const isRowExpanded = expandedTextRowIds?.has(rowId) ?? false;
+
+      const wrappedLinesCount = getWrappedLinesCount(ctx, node, line, i, maxTextWidth, worldFontSize, Math.max(6.2, worldFontSize * 0.54));
+      const finalCount = isRowExpanded ? wrappedLinesCount : Math.min(4, wrappedLinesCount);
+      rowLinesCount.push(finalCount);
+      totalBodyLines += finalCount;
+    }
+
+    const totalWorldRowsHeight = totalBodyLines * worldRowHeight;
+    const worldBlockStartY = worldBodyStartY + (worldBodyHeight - totalWorldRowsHeight) / 2;
+
+    const keyToWorldY = new Map<string, number>();
+    let currentLinesOffset = 0;
+    for (let i = 0; i < bodyLines.length; i++) {
+      const line = bodyLines[i]!;
+      const finalCount = rowLinesCount[i]!;
+      if (isExpandableLine(line)) {
+        const key = parseRowKey(line);
+        const rowCenterY = worldBlockStartY + currentLinesOffset * worldRowHeight + worldRowHeight / 2;
+        if (key !== null) {
+          keyToWorldY.set(key, fromPos.y + rowCenterY);
+        } else {
+          if (node.edgeLabel) {
+            keyToWorldY.set(node.edgeLabel, fromPos.y + rowCenterY);
+          }
+        }
+      }
+      currentLinesOffset += finalCount;
+    }
 
     for (const child of node.children) {
       const toPos = positions.get(child.id);
@@ -638,6 +1260,20 @@ export function drawGraphCanvas(options: RenderCanvasOptions): void {
       if (!toPos || !toSize) {
         continue;
       }
+
+      let startY = fromPos.y + fromSize.height / 2;
+      if (child.edgeLabel !== undefined) {
+        const baseKey = getGroupBaseKey(child.edgeLabel) || child.edgeLabel;
+        const targetY = keyToWorldY.get(baseKey);
+        if (targetY !== undefined) {
+          startY = targetY;
+        }
+      }
+
+      const fromRightW = {
+        x: fromPos.x + fromSize.width,
+        y: startY,
+      };
 
       // Connect to the left edge center of the child
       const toLeftW = {
@@ -790,7 +1426,29 @@ export function drawGraphCanvas(options: RenderCanvasOptions): void {
       const fontSize = worldFontSize * viewport.scale;
       const nodeFont = buildNodeFont(fontSize, font);
       const horizontalPadding = 14 * viewport.scale;
-      const maxTextWidth = screenWidth - horizontalPadding * 2;
+
+      const lines = label.split("\n").filter((line) => line.trim().length > 0);
+      const worldRowHeight = Math.max(worldFontSize + 6, worldFontSize * 1.55);
+      const rowHeight = worldRowHeight * viewport.scale;
+
+      const headerH = NODE_HEADER_WORLD_HEIGHT * viewport.scale;
+      const bodyStartY = screenPos.y + headerH;
+      const bodyHeight = screenHeight - headerH;
+
+      const firstLineIsItemHeader = lines.length > 1 && isArrayItemHeaderLine(lines[0]!);
+      const bodyLines = firstLineIsItemHeader ? lines.slice(1) : lines;
+
+      const hasWrappedLines = bodyLines.some((line, i) => {
+        const charW = Math.max(6.2, worldFontSize * 0.54) * viewport.scale;
+        const untruncated = getRowUntruncatedValue(node, line, i);
+        return untruncated.length * charW > screenWidth - horizontalPadding * 2 - 60 * viewport.scale;
+      });
+      const hasButtons = node.children.length > 0 || hasWrappedLines;
+      const rowBtnReserve = hasButtons
+        ? Math.max(5, 5.5 * viewport.scale) * 2 + (6 + 4) * viewport.scale
+        : 0;
+      const maxTextWidth = screenWidth - horizontalPadding - horizontalPadding - rowBtnReserve;
+
       if (maxTextWidth <= 10) {
         continue;
       }
@@ -799,67 +1457,185 @@ export function drawGraphCanvas(options: RenderCanvasOptions): void {
       context.textAlign = "left";
       context.textBaseline = "middle";
 
-      const lines = label.split("\n").filter((line) => line.trim().length > 0);
-      // Use world-proportional row height so spacing scales with the node,
-      // preventing excessive vertical padding when zoomed in.
+      const rowLinesCount: number[] = [];
+      const wrappedLinesLists: string[][] = [];
+      let totalBodyLines = 0;
 
-      const worldRowHeight = Math.max(worldFontSize + 6, worldFontSize * 1.55);
-      const rowHeight = worldRowHeight * viewport.scale;
+      for (let i = 0; i < bodyLines.length; i++) {
+        const line = bodyLines[i]!;
+        const rowKey = parseRowKey(line) || `row-${i}`;
+        const rowId = `${node.id}::${rowKey}`;
+        const isRowExpanded = expandedTextRowIds?.has(rowId) ?? false;
 
-      // Account for the header row at the top of the node
-      const headerH = NODE_HEADER_WORLD_HEIGHT * viewport.scale;
-      const bodyStartY = screenPos.y + headerH;
-      const bodyHeight = screenHeight - headerH;
+        const untruncatedVal = getRowUntruncatedValue(node, line, i);
+        const separatorIndex = line.indexOf(":");
+        let wrapped: string[] = [];
+        if (separatorIndex <= 0) {
+          wrapped = getWrappedLinesForValue(context, untruncatedVal, maxTextWidth, fontSize, Math.max(6.2, worldFontSize * 0.54) * viewport.scale);
+        } else {
+          const keyPart = line.slice(0, separatorIndex + 1);
+          const keyDisplay = `${keyPart} `;
+          const keyWidth = context.measureText(keyDisplay).width;
 
-      // If the first line is an array-item header ("Item N"), it's already shown
-      // in the node header bar — remove it before clipping body rows.
-      const firstLineIsItemHeader = lines.length > 1 && isArrayItemHeaderLine(lines[0]!);
-      const bodyLines = firstLineIsItemHeader ? lines.slice(1) : lines;
-      const maxVisibleLines = Math.max(1, Math.floor(Math.max(1, bodyHeight) / rowHeight + 0.05));
-      const visibleLines = bodyLines.slice(0, maxVisibleLines);
-      if (visibleLines.length === 0) {
-        continue;
+          if (keyWidth >= maxTextWidth - 6) {
+            wrapped = getWrappedLinesForValue(context, untruncatedVal, maxTextWidth, fontSize, Math.max(6.2, worldFontSize * 0.54) * viewport.scale);
+          } else {
+            const valueWidth = Math.max(1, maxTextWidth - keyWidth);
+            wrapped = getWrappedLinesForValue(context, untruncatedVal, valueWidth, fontSize, Math.max(6.2, worldFontSize * 0.54) * viewport.scale);
+          }
+        }
+
+        const count = Math.max(1, wrapped.length);
+        const finalCount = isRowExpanded ? count : Math.min(4, count);
+        rowLinesCount.push(finalCount);
+        wrappedLinesLists.push(wrapped);
+        totalBodyLines += finalCount;
       }
 
-      const totalRowsHeight = visibleLines.length * rowHeight;
-      // Compute starting Y so rows are vertically centered within the body
+      const totalRowsHeight = totalBodyLines * rowHeight;
       const blockStartY = bodyStartY + (bodyHeight - totalRowsHeight) / 2;
 
-      for (let i = 0; i < visibleLines.length; i += 1) {
-        const line = visibleLines[i]!;
-        const rowTop = blockStartY + i * rowHeight;
-        const rowCenterY = rowTop + rowHeight / 2;
+      let currentRowTop = blockStartY;
+
+      for (let i = 0; i < bodyLines.length; i += 1) {
+        const line = bodyLines[i]!;
+        const rowKey = parseRowKey(line) || `row-${i}`;
+        const rowId = `${node.id}::${rowKey}`;
+        const isRowExpanded = expandedTextRowIds?.has(rowId) ?? false;
+
+        const finalRowLines = rowLinesCount[i]!;
+        const rowHeightForThisRow = finalRowLines * rowHeight;
+        const wrappedLines = wrappedLinesLists[i]!;
+        const wrappedLinesCount = Math.max(1, wrappedLines.length);
 
         if (i > 0) {
           context.strokeStyle = isSelected ? colors.rowSeparatorSelected : colors.rowSeparator;
           context.lineWidth = 0.5;
           context.beginPath();
-          context.moveTo(screenPos.x + 1, rowTop);
-          context.lineTo(screenPos.x + screenWidth - 1, rowTop);
+          context.moveTo(screenPos.x + 1, currentRowTop);
+          context.lineTo(screenPos.x + screenWidth - 1, currentRowTop);
           context.stroke();
         }
 
-        if (brokenNode) {
-          const fittedLine = truncateLabelToWidth(context, line, maxTextWidth);
-          if (!fittedLine) {
-            continue;
+        const separatorIndex = line.indexOf(":");
+        const hasKey = !brokenNode && separatorIndex > 0;
+
+        let keyWidth = 0;
+        let valueWidth = maxTextWidth;
+        let keyDisplay = "";
+        let valuePart = line;
+
+        if (hasKey) {
+          const keyPart = line.slice(0, separatorIndex + 1);
+          valuePart = line.slice(separatorIndex + 1).trimStart();
+          keyDisplay = `${keyPart} `;
+          keyWidth = context.measureText(keyDisplay).width;
+          if (keyWidth >= maxTextWidth - 6) {
+            keyWidth = 0;
+            valueWidth = maxTextWidth;
+            valuePart = line;
+          } else {
+            valueWidth = Math.max(1, maxTextWidth - keyWidth);
           }
-          context.fillStyle = isSelected ? BROKEN_TEXT_SELECTED : BROKEN_TEXT;
-          context.fillText(fittedLine, screenPos.x + horizontalPadding, rowCenterY);
-          continue;
         }
 
-        drawLabelLine(
-          context,
-          line,
-          screenPos.x + horizontalPadding,
-          rowCenterY,
-          maxTextWidth,
-          isSelected,
-          textColor,
-          false,
-          colors,
-          fontSize,
+        // Draw key on the first line if present
+        if (keyWidth > 0) {
+          const firstLineCenterY = currentRowTop + rowHeight / 2;
+          context.fillStyle = isSelected ? colors.textItemHeaderSelected : colors.textKey;
+          context.fillText(keyDisplay, screenPos.x + horizontalPadding, firstLineCenterY);
+        }
+
+        // Determine value start X position
+        const startX = screenPos.x + horizontalPadding + keyWidth;
+
+        // Resolve value color
+        let valColor = isSelected ? colors.selectedTextDefault : textColor;
+        if (brokenNode) {
+          valColor = isSelected ? BROKEN_TEXT_SELECTED : BROKEN_TEXT;
+        } else if (hasKey && keyWidth > 0) {
+          valColor = getValueColor(valuePart, isSelected, textColor, colors);
+        } else {
+          valColor = getValueColor(line, isSelected, textColor, colors);
+        }
+
+        for (let k = 0; k < finalRowLines; k++) {
+          const lineCenterY = currentRowTop + k * rowHeight + rowHeight / 2;
+          const textLine = wrappedLines[k] ?? "";
+          const isTextToggle = wrappedLinesCount > 4;
+          const isLastLine = k === finalRowLines - 1;
+          const isCollapsedLastLine = !isRowExpanded && isTextToggle && k === 3;
+
+          if (isCollapsedLastLine) {
+            const { text: truncatedText, suffixXOffset } = truncateLineWithSuffix(
+              context,
+              textLine,
+              " ... read more",
+              valueWidth,
+              Math.max(6.2, worldFontSize * 0.54) * viewport.scale
+            );
+            context.fillStyle = valColor;
+            context.fillText(truncatedText, startX, lineCenterY);
+            context.fillStyle = colors.textSummary;
+            context.fillText(" ... read more", startX + suffixXOffset, lineCenterY);
+          } else if (isRowExpanded && isTextToggle && isLastLine) {
+            const { text: truncatedText, suffixXOffset } = truncateLineWithSuffix(
+              context,
+              textLine,
+              " (show less)",
+              valueWidth,
+              Math.max(6.2, worldFontSize * 0.54) * viewport.scale
+            );
+            context.fillStyle = valColor;
+            context.fillText(truncatedText, startX, lineCenterY);
+            context.fillStyle = colors.textSummary;
+            context.fillText(" (show less)", startX + suffixXOffset, lineCenterY);
+          } else {
+            let valX = startX;
+            if (k === 0 && hasKey && keyWidth > 0) {
+              const hexColorMatch = valuePart.match(/^#([0-9A-Fa-f]{3,8})$/);
+              if (hexColorMatch && fontSize) {
+                const dotRadius = Math.max(3, fontSize * 0.35);
+                const dotCenterX = valX + dotRadius;
+                context.beginPath();
+                context.arc(dotCenterX, lineCenterY, dotRadius, 0, Math.PI * 2);
+                context.fillStyle = valuePart;
+                context.fill();
+                context.strokeStyle = "rgba(128,128,128,0.4)";
+                context.lineWidth = 0.5;
+                context.stroke();
+                valX += dotRadius * 2 + 4;
+              }
+            }
+            context.fillStyle = valColor;
+            context.fillText(textLine, valX, lineCenterY);
+          }
+        }
+
+        currentRowTop += rowHeightForThisRow;
+      }
+
+      // Draw per-row expand buttons
+      const rowZones = computeNodeRowExpandZones(
+        node,
+        screenPos,
+        screenWidth,
+        screenHeight,
+        viewport.scale,
+        font,
+        expandedTextRowIds,
+      );
+      if (rowZones.length > 0) {
+        const iconColor = brokenNode
+          ? (isSelected ? BROKEN_ICON_COLOR_SELECTED : BROKEN_ICON_COLOR)
+          : (isSelected ? colors.iconColorSelected : colors.iconColor);
+        drawNodeRowExpandButtons(
+          context, rowZones,
+          hiddenIds ?? new Set(),
+          expandedIds ?? new Set(),
+          viewport.scale, iconColor,
+          hiddenGroupKeys,
+          expandedTextRowIds,
         );
       }
     }

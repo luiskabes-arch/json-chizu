@@ -69,10 +69,23 @@ export function flatten<T = unknown>(root: ShikoNode<T>): ShikoNode<T>[] {
 
   return result;
 }
+/**
+ * Extracts the base array key from an edge label, e.g.
+ * "content[0]" → "content", "[0]" → null, "marks[1][0]" → "marks[1]"
+ */
+export function getGroupBaseKey(edgeLabel: string): string | null {
+  const match = edgeLabel.match(/^(.*)\[\d+\]$/);
+  if (!match) return null;
+  const base = match[1];
+  return base && base.length > 0 ? base : null;
+}
+
 
 export function flattenVisible<T = unknown>(
   root: ShikoNode<T>,
   expandedIds: ReadonlySet<string>,
+  hiddenIds?: ReadonlySet<string>,
+  hiddenGroupKeys?: ReadonlyMap<string, ReadonlySet<string>>,
 ): ShikoNode<T>[] {
   const result: ShikoNode<T>[] = [];
   const stack: ShikoNode<T>[] = [root];
@@ -88,8 +101,17 @@ export function flattenVisible<T = unknown>(
       continue;
     }
 
+    const nodeHiddenGroups = hiddenGroupKeys?.get(node.id);
+
     for (let i = node.children.length - 1; i >= 0; i -= 1) {
-      stack.push(node.children[i]!);
+      const child = node.children[i]!;
+      if (hiddenIds?.has(child.id)) continue;
+      // Group hiding: skip children whose array-key group is hidden
+      if (nodeHiddenGroups?.size && child.edgeLabel) {
+        const groupKey = getGroupBaseKey(child.edgeLabel);
+        if (groupKey && nodeHiddenGroups.has(groupKey)) continue;
+      }
+      stack.push(child);
     }
   }
 

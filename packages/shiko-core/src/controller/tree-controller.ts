@@ -15,6 +15,9 @@ export interface TreeControllerOptions<T = unknown> {
 export class ShikoTreeController<T = unknown> extends ListenableStore {
   private _root: ShikoNode<T> | null;
   private readonly expanded = new Set<string>();
+  private readonly hidden = new Set<string>();
+  private readonly hiddenGroups = new Map<string, Set<string>>();
+  private readonly expandedTextRows = new Set<string>();
 
   private _treeRevision = 0;
   private _expansionRevision = 0;
@@ -46,10 +49,40 @@ export class ShikoTreeController<T = unknown> extends ListenableStore {
     return this.expanded;
   }
 
+  get hiddenIds(): ReadonlySet<string> {
+    return this.hidden;
+  }
+
+  get hiddenGroupKeys(): ReadonlyMap<string, ReadonlySet<string>> {
+    return this.hiddenGroups;
+  }
+
+  get expandedTextRowIds(): ReadonlySet<string> {
+    return this.expandedTextRows;
+  }
+
   setRoot(root: ShikoNode<T>): void {
     this._root = root;
+    this.hidden.clear();
+    this.hiddenGroups.clear();
+    this.expandedTextRows.clear();
     this._treeRevision += 1;
     this.emit();
+  }
+
+  toggleTextRowExpansion(nodeId: string, rowKey: string): void {
+    const rowId = `${nodeId}::${rowKey}`;
+    if (this.expandedTextRows.has(rowId)) {
+      this.expandedTextRows.delete(rowId);
+    } else {
+      this.expandedTextRows.add(rowId);
+    }
+    this._expansionRevision += 1;
+    this.emit();
+  }
+
+  isTextRowExpanded(nodeId: string, rowKey: string): boolean {
+    return this.expandedTextRows.has(`${nodeId}::${rowKey}`);
   }
 
   isExpanded(nodeId: string): boolean {
@@ -90,6 +123,62 @@ export class ShikoTreeController<T = unknown> extends ListenableStore {
     }
     this._expansionRevision += 1;
     this.emit();
+  }
+
+  /**
+   * Toggle whether a specific child node is hidden from the canvas.
+   * Hidden nodes and all their descendants are removed from the layout.
+   */
+  toggleHidden(nodeId: string): void {
+    if (this.hidden.has(nodeId)) {
+      this.hidden.delete(nodeId);
+    } else {
+      this.hidden.add(nodeId);
+    }
+    this._expansionRevision += 1;
+    this.emit();
+  }
+
+  hideNode(nodeId: string): void {
+    if (this.hidden.has(nodeId)) return;
+    this.hidden.add(nodeId);
+    this._expansionRevision += 1;
+    this.emit();
+  }
+
+  showNode(nodeId: string): void {
+    if (!this.hidden.delete(nodeId)) return;
+    this._expansionRevision += 1;
+    this.emit();
+  }
+
+  isHidden(nodeId: string): boolean {
+    return this.hidden.has(nodeId);
+  }
+
+  /**
+   * Toggle visibility of all array items with the given base key under a parent node.
+   * Used when arrays are spread directly as children (no intermediate array node).
+   * E.g. toggleHiddenGroup(parentId, "content") hides/shows content[0], content[1], etc.
+   */
+  toggleHiddenGroup(parentId: string, groupKey: string): void {
+    let groups = this.hiddenGroups.get(parentId);
+    if (!groups) {
+      groups = new Set();
+      this.hiddenGroups.set(parentId, groups);
+    }
+    if (groups.has(groupKey)) {
+      groups.delete(groupKey);
+      if (groups.size === 0) this.hiddenGroups.delete(parentId);
+    } else {
+      groups.add(groupKey);
+    }
+    this._expansionRevision += 1;
+    this.emit();
+  }
+
+  isGroupHidden(parentId: string, groupKey: string): boolean {
+    return this.hiddenGroups.get(parentId)?.has(groupKey) ?? false;
   }
 
   expandAll(): void {
@@ -143,7 +232,7 @@ export class ShikoTreeController<T = unknown> extends ListenableStore {
       return [];
     }
 
-    return flattenVisible(this._root, this.expanded);
+    return flattenVisible(this._root, this.expanded, this.hidden, this.hiddenGroups);
   }
 
   getParentId(nodeId: string): string | null {
