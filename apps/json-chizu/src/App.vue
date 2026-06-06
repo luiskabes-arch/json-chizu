@@ -17,8 +17,10 @@
         <EditorToolbar
           :is-parsing="isParsing"
           :can-download="jsonText.trim().length > 0"
+          :can-format="jsonText.trim().length > 0"
           @file-selected="onFileSelected"
           @download="onDownloadJson"
+          @format="onFormat"
           @parse="onParseClick"
           @load-sample="onLoadSample"
           @clear="onClear"
@@ -231,6 +233,7 @@ import { useTheme } from "./composables/useTheme";
 import { useSidebar } from "./composables/useSidebar";
 import { useContextMenu } from "./composables/useContextMenu";
 import { convertJsonToShiko } from "./lib/json-to-shiko";
+import { formatSource } from "./lib/formatter";
 import {
   LAYOUT_MODE_STORAGE_KEY,
   getInitialLayoutMode,
@@ -560,6 +563,32 @@ function onDownloadJson(): void {
   link.click();
 
   URL.revokeObjectURL(url);
+}
+
+function onFormat(): void {
+  const text = jsonText.value;
+  if (!text.trim()) {
+    return;
+  }
+
+  const formatType = preferredSourceFormat.value === "auto"
+    ? parsedSourceFormat.value
+    : preferredSourceFormat.value;
+
+  try {
+    const formatted = formatSource(text, formatType);
+    jsonText.value = formatted;
+    onParseClick();
+  } catch (error: any) {
+    setParseError(
+      error.message || "Formatting failed",
+      {
+        line: error.line ?? null,
+        column: error.column ?? null,
+        stage: "parse",
+      }
+    );
+  }
 }
 
 function onNodeFocus(nodeId: string): void {

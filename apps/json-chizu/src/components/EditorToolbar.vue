@@ -28,6 +28,16 @@
         <div class="i-lucide-download size-4" />
       </ToolbarIconButton>
 
+      <!-- Format Document -->
+      <ToolbarIconButton
+        :disabled="props.isParsing || !props.canFormat"
+        title="Format document (JSON, YAML, or JSONL)"
+        :ariaLabel="'Format document'"
+        @click="emit('format')"
+      >
+        <div class="i-lucide-align-left size-4" />
+      </ToolbarIconButton>
+
       <!-- Load sample -->
       <div ref="sampleMenuRef" class="relative">
         <ToolbarIconButton
@@ -104,14 +114,17 @@ type SampleFormat = "json" | "yaml" | "jsonl";
 const props = withDefaults(defineProps<{
   isParsing?: boolean;
   canDownload?: boolean;
+  canFormat?: boolean;
 }>(), {
   isParsing: false,
   canDownload: false,
+  canFormat: false,
 });
 
 const emit = defineEmits<{
   (event: "file-selected", file: File): void;
   (event: "download"): void;
+  (event: "format"): void;
   (event: "parse"): void;
   (event: "load-sample", format: SampleFormat): void;
   (event: "clear"): void;
